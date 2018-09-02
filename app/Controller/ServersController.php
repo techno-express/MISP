@@ -31,7 +31,7 @@ class ServersController extends AppController
     public function beforeFilter()
     {
         parent::beforeFilter();
-
+		$this->Security->unlockedActions[] = 'getApiInfo';
         // permit reuse of CSRF tokens on some pages.
         switch ($this->request->params['action']) {
             case 'push':
@@ -1642,6 +1642,9 @@ class ServersController extends AppController
         } else {
             throw new InvalidArgumentException('Url not set.');
         }
+		if (!empty($request['skip_ssl_validation'])) {
+			$params['ssl_verify_peer'] = false;
+		}
         App::uses('HttpSocket', 'Network/Http');
         $HttpSocket = new HttpSocket($params);
         $view_data = array();
@@ -1687,4 +1690,21 @@ class ServersController extends AppController
         }
         return $view_data;
     }
+
+	public function getApiInfo() {
+		$relative_path = $this->request->data['url'];
+		$result = $this->RestResponse->getApiInfo($relative_path);
+		if ($this->_isRest()) {
+			return $result;
+		} else {
+			$result = json_decode($result, true);
+			if (empty($result)) {
+				return $this->RestResponse->viewData('&nbsp;', $this->response->type());
+			}
+			$this->layout = false;
+			$this->autoRender = false;
+			$this->set('api_info', $result);
+			$this->render('ajax/get_api_info');
+		}
+	}
 }
