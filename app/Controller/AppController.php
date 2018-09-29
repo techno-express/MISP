@@ -47,7 +47,7 @@ class AppController extends Controller
     public $helpers = array('Utility', 'OrgImg');
 
     private $__queryVersion = '44';
-    public $pyMispVersion = '2.4.93';
+    public $pyMispVersion = '2.4.95';
     public $phpmin = '5.6.5';
     public $phprec = '7.0.16';
 
@@ -90,6 +90,7 @@ class AppController extends Controller
             'ACL',
             'RestResponse',
             'Flash'
+			//,'DebugKit.Toolbar'
     );
 
     private function __isApiFunction($controller, $action)
@@ -559,6 +560,7 @@ class AppController extends Controller
                 );
                 return false;
             }
+			$key = 'json';
         } else {
             if (!$this->Auth->user('id')) {
                 $exception = $this->RestResponse->throwException(
@@ -569,7 +571,6 @@ class AppController extends Controller
             }
             $user = $this->Auth->user();
         }
-		$key = 'json';
         return $user;
     }
 

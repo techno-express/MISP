@@ -24,9 +24,6 @@ from misp2stix2_mapping import *
 from collections import defaultdict
 from copy import deepcopy
 
-non_indicator_attributes = ['text', 'comment', 'other', 'link', 'target-user', 'target-email',
-                            'target-machine', 'target-org', 'target-location', 'target-external',
-                            'vulnerability']
 misp_hash_types = ["authentihash", "ssdeep", "imphash", "md5", "sha1", "sha224",
                    "sha256", "sha384", "sha512", "sha512/224","sha512/256","tlsh"]
 attack_pattern_galaxies_list = ['mitre-attack-pattern', 'mitre-enterprise-attack-attack-pattern',
@@ -49,19 +46,21 @@ class StixBuilder():
         self.external_refs = []
         self.galaxies = []
         self.relationships = defaultdict(list)
+        self.to_return = {}
 
     def loadEvent(self, args):
         pathname = os.path.dirname(args[0])
         filename = os.path.join(pathname, args[1])
+        self.orgs = [org for org in args[2:]] if len(args) > 2 else []
         self.misp_event.load_file(filename)
         self.filename = filename
         self.report_id = "report--{}".format(self.misp_event.uuid)
 
     def buildEvent(self):
-        self.__set_identity()
+        i = self.__set_identity()
         self.read_attributes()
         report = self.eventReport()
-        self.SDOs.insert(1, report)
+        self.SDOs.insert(i, report)
 
     def eventReport(self):
         report_args = {'type': 'report', 'id': self.report_id, 'name': self.misp_event.info,
@@ -85,68 +84,51 @@ class StixBuilder():
         outputfile = "{}.out".format(self.filename)
         with open(outputfile, 'w') as f:
             f.write(json.dumps(self.SDOs, cls=base.STIXJSONEncoder))
+        self.to_return['success'] = 1
+        print(json.dumps(self.to_return))
 
     def __set_identity(self):
         org = self.misp_event.Orgc
-        identity_id = 'identity--{}'.format(org['uuid'])
-        identity = Identity(type="identity", id=identity_id,
-                            name=org["name"], identity_class="organization")
-        self.SDOs.append(identity)
+        org_uuid = org['uuid']
+        identity_id = 'identity--{}'.format(org_uuid)
         self.identity_id = identity_id
+        if org_uuid not in self.orgs:
+            identity = Identity(type="identity", id=identity_id,
+                                name=org["name"], identity_class="organization")
+            self.SDOs.append(identity)
+            self.to_return['org'] = org_uuid
+            return 1
+        return 0
 
     def misp_types(self):
         describe_types_filename = os.path.join(pymisp.__path__[0], 'data/describeTypes.json')
         describe_types = open(describe_types_filename, 'r')
-        self.categories_mapping = json.loads(describe_types.read())['result']['category_type_mappings']
+        categories_mapping = json.loads(describe_types.read())['result']['category_type_mappings']
+        for category in categories_mapping:
+            mispTypesMapping[category] = {'to_call': 'handle_person'}
 
     def read_attributes(self):
         self.misp_types()
         if hasattr(self.misp_event, 'attributes') and self.misp_event.attributes:
             for attribute in self.misp_event.attributes:
-                attribute_type = attribute.type
-                if attribute_type in non_indicator_attributes:
-                    self.handle_non_indicator(attribute, attribute_type)
-                else:
-                    if attribute_type in self.categories_mapping['Person']:
-                        self.handle_person(attribute)
-                    elif attribute_type in mispTypesMapping:
-                        self.handle_usual_type(attribute)
-                    else:
-                        self.add_custom(attribute)
+                try:
+                    getattr(self, mispTypesMapping[attribute.type]['to_call'])(attribute)
+                except KeyError:
+                    self.add_custom(attribute)
         if hasattr(self.misp_event, 'objects') and self.misp_event.objects:
             self.load_objects_mapping()
-            objects_to_parse = defaultdict(dict)
+            self.objects_to_parse = defaultdict(dict)
             misp_objects = self.misp_event.objects
             self.object_references, self.processes = self.fetch_object_references(misp_objects)
             for misp_object in misp_objects:
                 to_ids = self.fetch_ids_flag(misp_object.attributes)
                 name = misp_object.name
-                if name == "vulnerability":
-                    self.add_object_vulnerability(misp_object, to_ids)
-                elif name == "course-of-action":
-                    self.add_course_of_action(misp_object, from_object=True)
-                elif name in ('pe', 'pe-section'):
-                    objects_to_parse[name][misp_object.uuid] = to_ids, misp_object
-                elif name in objectsMapping:
-                    if  name == 'file' and misp_object.references:
-                        to_parse = False
-                        for reference in misp_object.references:
-                            if reference.relationship_type == 'included-in' and reference.Object['name'] == "pe":
-                                objects_to_parse[name][misp_object.uuid] = to_ids, misp_object
-                                to_parse = True
-                                break
-                        if to_parse:
-                            continue
-                    try:
-                        if to_ids or name == "stix2-pattern":
-                            self.add_object_indicator(misp_object)
-                        else:
-                            self.add_object_observable(misp_object)
-                    except:
-                        self.add_object_custom(misp_object, to_ids)
-                else:
+                try:
+                    getattr(self, objectsMapping[name]['to_call'])(misp_object, to_ids)
+                except KeyError:
                     self.add_object_custom(misp_object, to_ids)
-            if objects_to_parse: self.resolve_objects2parse(objects_to_parse)
+            if self.objects_to_parse:
+                self.resolve_objects2parse()
         if hasattr(self.misp_event, 'Galaxy') and self.misp_event.Galaxy:
             for galaxy in self.misp_event.Galaxy:
                 self.parse_galaxy(galaxy, self.report_id)
@@ -187,7 +169,7 @@ class StixBuilder():
             'x509': {'observable': self.resolve_x509_observable,
                      'pattern': self.resolve_x509_pattern}
         }
-        self.galaxies_mapping = {'branded-vulnerability': ['vulnerability', self.add_vulnerability]}
+        self.galaxies_mapping = {'branded-vulnerability': ['vulnerability', self.add_vulnerability_from_galaxy]}
         self.galaxies_mapping.update(dict.fromkeys(attack_pattern_galaxies_list, ['attack-pattern', self.add_attack_pattern]))
         self.galaxies_mapping.update(dict.fromkeys(course_of_action_galaxies_list, ['course-of-action', self.add_course_of_action]))
         self.galaxies_mapping.update(dict.fromkeys(intrusion_set_galaxies_list, ['intrusion-set', self.add_intrusion_set]))
@@ -227,23 +209,6 @@ class StixBuilder():
             process['type'] = 'process'
             processes[pid] = process
 
-    def handle_non_indicator(self, attribute, attribute_type):
-        if attribute_type == "link":
-            self.handle_link(attribute)
-        elif attribute_type in ('text', 'comment', 'other') or attribute_type not in mispTypesMapping:
-            self.add_custom(attribute)
-        else:
-            try:
-                self.handle_non_indicator_attribute(attribute, attribute_type)
-            except:
-                self.add_custom(attribute)
-
-    def handle_non_indicator_attribute(self, attribute, attribute_type):
-        if attribute_type == "vulnerability":
-            self.add_vulnerability(attribute, from_galaxy=False)
-        else:
-            self.add_observed_data(attribute)
-
     def handle_person(self, attribute):
         if attribute.category == "Person":
             self.add_identity(attribute)
@@ -259,6 +224,21 @@ class StixBuilder():
         except:
             self.add_custom(attribute)
 
+    def handle_usual_object_name(self, misp_object, to_ids):
+        name = misp_object.name
+        if  name == 'file' and misp_object.references:
+            for reference in misp_object.references:
+                if reference.relationship_type == 'included-in' and reference.Object['name'] == "pe":
+                    self.objects_to_parse[name][misp_object.uuid] = to_ids, misp_object
+                    return
+        try:
+            if to_ids or name == "stix2-pattern":
+                self.add_object_indicator(misp_object)
+            else:
+                self.add_object_observable(misp_object)
+        except:
+            self.add_object_custom(misp_object, to_ids)
+
     def handle_link(self, attribute):
         url = attribute.value
         source = "url"
@@ -270,8 +250,11 @@ class StixBuilder():
         link = {'source_name': source, 'url': url}
         self.external_refs.append(link)
 
-    def resolve_objects2parse(self, objects2parse):
-        for uuid, misp_object in objects2parse['file'].items():
+    def populate_objects_to_parse(self, misp_object, to_ids):
+        self.objects_to_parse[misp_object.name][misp_object.uuid] = to_ids, misp_object
+
+    def resolve_objects2parse(self):
+        for uuid, misp_object in self.objects_to_parse['file'].items():
             to_ids_file, file_object = misp_object
             file_id = "file--{}".format(file_object.uuid)
             to_ids_list = [to_ids_file]
@@ -280,12 +263,12 @@ class StixBuilder():
                 if reference.relationship_type == "included-in" and reference.Object['name'] == "pe":
                     pe_uuid = reference.referenced_uuid
                     break
-            to_ids_pe, pe_object = objects2parse['pe'][pe_uuid]
+            to_ids_pe, pe_object = self.objects_to_parse['pe'][pe_uuid]
             to_ids_list.append(to_ids_pe)
             sections = []
             for reference in pe_object.references:
                 if reference.Object['name'] == "pe-section":
-                    to_ids_section, section_object = objects2parse['pe-section'][reference.referenced_uuid]
+                    to_ids_section, section_object = self.objects_to_parse['pe-section'][reference.referenced_uuid]
                     to_ids_list.append(to_ids_section)
                     sections.append(section_object)
             if True in to_ids_list:
@@ -363,16 +346,14 @@ class StixBuilder():
 
     @staticmethod
     def generate_galaxy_args(galaxy, b_killchain, b_alias, sdo_type):
-        galaxy_type = galaxy.get('type')
-        name = galaxy.get('name')
         cluster = galaxy['GalaxyCluster'][0]
         sdo_id = "{}--{}".format(sdo_type, cluster.get('uuid'))
-        description = "{} | {}".format(galaxy.get('description'), cluster.get('description'))
-        labels = ['misp:type=\"{}\"'.format(galaxy_type)]
-        sdo_args = {'id': sdo_id, 'type': sdo_type, 'name': name, 'description': description}
+        description = "{} | {}".format(galaxy['description'], cluster['description'])
+        labels = ['misp:name=\"{}\"'.format(galaxy['name'])]
+        sdo_args = {'id': sdo_id, 'type': sdo_type, 'name': cluster['value'], 'description': description}
         if b_killchain:
             killchain = [{'kill_chain_name': 'misp-category',
-                          'phase_name': galaxy_type}]
+                          'phase_name': galaxy['type']}]
             sdo_args['kill_chain_phases'] = killchain
         if cluster['tag_name']:
             labels.append(cluster.get('tag_name'))
@@ -391,21 +372,25 @@ class StixBuilder():
         attack_pattern = AttackPattern(**a_p_args)
         self.append_object(attack_pattern, a_p_id)
 
-    def add_course_of_action(self, misp_object, from_object=False):
-        if from_object:
-            coa_id = 'course-of-action--{}'.format(misp_object.uuid)
-            coa_args = {'id': coa_id, 'type': 'course-of-action'}
-            for attribute in misp_object.attributes:
-                self.parse_galaxies(attribute.Galaxy, coa_id)
-                relation = attribute.object_relation
-                if relation == 'name':
-                    coa_args['name'] = attribute.value
-                elif relation == 'description':
-                    coa_args['description'] = attribute.value
-            if not 'name' in coa_args:
-                return
-        else:
-            coa_args, coa_id = self.generate_galaxy_args(misp_object, False, False, 'course-of-action')
+    def add_course_of_action(self, misp_object):
+        coa_args, coa_id = self.generate_galaxy_args(misp_object, False, False, 'course-of-action')
+        self.add_coa_stix_object(coa_args, coa_id)
+
+    def add_course_of_action_from_object(self, misp_object, _):
+        coa_id = 'course-of-action--{}'.format(misp_object.uuid)
+        coa_args = {'id': coa_id, 'type': 'course-of-action'}
+        for attribute in misp_object.attributes:
+            self.parse_galaxies(attribute.Galaxy, coa_id)
+            relation = attribute.object_relation
+            if relation == 'name':
+                coa_args['name'] = attribute.value
+            elif relation == 'description':
+                coa_args['description'] = attribute.value
+        if not 'name' in coa_args:
+            return
+        self.add_coa_stix_object(coa_args, coa_id)
+
+    def add_coa_stix_object(self, coa_args):
         coa_args['created_by_ref'] = self.identity_id
         course_of_action = CourseOfAction(**coa_args)
         self.append_object(course_of_action, coa_id)
@@ -455,6 +440,11 @@ class StixBuilder():
         pattern = mispTypesMapping[attribute_type]['pattern'](attribute_type, attribute_value, b64encode(attribute.data.getbuffer()).decode()[1:-1]) if ('data' in attribute and attribute.data) else self.define_pattern(attribute_type, attribute_value)
         indicator_args = {'id': indicator_id, 'type': 'indicator', 'labels': labels, 'kill_chain_phases': killchain,
                            'valid_from': self.misp_event.date, 'created_by_ref': self.identity_id, 'pattern': pattern}
+        if hasattr(attribute, 'Sighting'):
+            for sighting in attribute.Sighting:
+                if sighting['Organisation']['name'] == self.misp_event.Orgc.name and sighting['type'] == "2":
+                    indicator_args['valid_until'] = datetime.datetime.fromtimestamp(int(sighting['date_sighting']), datetime.timezone.utc).isoformat()
+                    break
         if hasattr(attribute, 'comment') and attribute.comment:
             indicator_args['description'] = attribute.comment
         indicator = Indicator(**indicator_args)
@@ -498,31 +488,33 @@ class StixBuilder():
         tool = Tool(**tool_args)
         self.append_object(tool, tool_id)
 
-    def add_vulnerability(self, attribute, from_galaxy=True):
-        if from_galaxy:
-            vulnerability_id = "vulnerability--{}".format(attribute['uuid'])
-            cluster = attribute['GalaxyCluster'][0]
-            name = cluster['value']
-            if cluster['meta'] and cluster['meta']['aliases']:
-                vulnerability_data = [mispTypesMapping['vulnerability'](alias) for alias in cluster['meta']['aliases']]
-            else:
-                vulnerability_data = [mispTypesMapping['vulnerability'](name)]
-            labels = ['misp:type=\"{}\"'.format(attribute.get('type'))]
-            if cluster['tag_name']:
-                labels.append(cluster['tag_name'])
-            description = "{} | {}".format(attribute.get('description'), cluster.get('description'))
-            vulnerability_args = {'id': vulnerability_id, 'type': 'vulnerability',
-                                  'name': name, 'external_references': vulnerability_data,
-                                  'created_by_ref': self.identity_id, 'labels': labels,
-                                  'description': description}
+    def add_vulnerability(self, attribute):
+        vulnerability_id = "vulnerability--{}".format(attribute.uuid)
+        name = attribute.value
+        vulnerability_data = [mispTypesMapping['vulnerability']['vulnerability_args'](name)]
+        labels = self.create_labels(attribute)
+        vulnerability_args = {'id': vulnerability_id, 'type': 'vulnerability',
+                              'name': name, 'external_references': vulnerability_data,
+                              'created_by_ref': self.identity_id, 'labels': labels}
+        vulnerability = Vulnerability(**vulnerability_args)
+        self.append_object(vulnerability, vulnerability_id)
+
+    def add_vulnerability_from_galaxy(self, attribute):
+        vulnerability_id = "vulnerability--{}".format(attribute['uuid'])
+        cluster = attribute['GalaxyCluster'][0]
+        name = cluster['value']
+        if cluster['meta'] and cluster['meta']['aliases']:
+            vulnerability_data = [mispTypesMapping['vulnerability']['vulnerability_args'](alias) for alias in cluster['meta']['aliases']]
         else:
-            vulnerability_id = "vulnerability--{}".format(attribute.uuid)
-            name = attribute.value
-            vulnerability_data = [mispTypesMapping['vulnerability'](name)]
-            labels = self.create_labels(attribute)
-            vulnerability_args = {'id': vulnerability_id, 'type': 'vulnerability',
-                                  'name': name, 'external_references': vulnerability_data,
-                                  'created_by_ref': self.identity_id, 'labels': labels}
+            vulnerability_data = [mispTypesMapping['vulnerability']['vulnerability_args'](name)]
+        labels = ['misp:type=\"{}\"'.format(attribute.get('type'))]
+        if cluster['tag_name']:
+            labels.append(cluster['tag_name'])
+        description = "{} | {}".format(attribute.get('description'), cluster.get('description'))
+        vulnerability_args = {'id': vulnerability_id, 'type': 'vulnerability',
+                              'name': name, 'external_references': vulnerability_data,
+                              'created_by_ref': self.identity_id, 'labels': labels,
+                              'description': description}
         vulnerability = Vulnerability(**vulnerability_args)
         self.append_object(vulnerability, vulnerability_id)
 
@@ -549,7 +541,7 @@ class StixBuilder():
         class Custom(object):
             def __init__(self, **kwargs):
                 return
-        custom_object = Custom(**custom_object_args, )
+        custom_object = Custom(**custom_object_args)
         self.append_object(custom_object, custom_object_id)
 
     def add_object_indicator(self, misp_object, pattern_arg=None):
@@ -566,8 +558,8 @@ class StixBuilder():
         indicator_args = {'id': indicator_id, 'valid_from': self.misp_event.date, 'type': 'indicator',
                           'labels': labels, 'description': misp_object.description,
                           'pattern': pattern, 'kill_chain_phases': killchain,
-                          'created_by_ref': self.identity_id}
-        indicator = Indicator(**indicator_args, allow_custom=True)
+                          'created_by_ref': self.identity_id, 'allow_custom': True}
+        indicator = Indicator(**indicator_args)
         self.append_object(indicator, indicator_id)
 
     def add_object_observable(self, misp_object, observable_arg=None):
@@ -584,9 +576,9 @@ class StixBuilder():
         observed_data_args = {'id': observed_data_id, 'type': 'observed-data',
                               'number_observed': 1, 'labels': labels, 'objects': observable_objects,
                               'first_observed': timestamp, 'last_observed': timestamp,
-                              'created_by_ref': self.identity_id}
+                              'created_by_ref': self.identity_id, 'allow_custom': True}
         try:
-            observed_data = ObservedData(**observed_data_args, allow_custom=True)
+            observed_data = ObservedData(**observed_data_args)
         except exceptions.InvalidValueError:
             observed_data = self.fix_enumeration_issues(name, observed_data_args)
         self.append_object(observed_data, observed_data_id)
@@ -602,16 +594,16 @@ class StixBuilder():
             for field in ('address_family', 'protocol_family'):
                 enumeration_fails[field] = current_dict.pop(field)
                 try:
-                    return ObservedData(**ns_args, allow_custom=True)
+                    return ObservedData(**ns_args)
                 except exceptions.InvalidValueError:
                     current_dict[field] = enumeration_fails[field]
             for field in enumeration_fails:
                 current_dict.pop(field)
             try:
-                return ObservedData(**ns_args, allow_custom=True)
+                return ObservedData(**ns_args)
             except:
                 pass
-        return ObservedData(**args, allow_custom=True)
+        return ObservedData(**args)
 
     def add_object_vulnerability(self, misp_object, to_ids):
         vulnerability_id = 'vulnerability--{}'.format(misp_object.uuid)
@@ -864,7 +856,7 @@ class StixBuilder():
                 malware_sample['filename'] = filename
                 malware_sample['md5'] = md5
                 if attribute.data:
-                    pattern += "{} AND ".format(attribute_data_pattern(b64encode(attribute.data.getbuffer()).decode()[1:-1]))
+                    pattern += "{} AND ".format(attribute_data_pattern(b64encode(attribute.data.getbuffer()).decode()))
             elif attribute_type in ("filename", "md5"):
                 d_pattern[attribute_type] = attribute.value
             else:
@@ -1220,7 +1212,6 @@ def main(args):
     stix_builder.loadEvent(args)
     stix_builder.buildEvent()
     stix_builder.saveFile()
-    print(1)
 
 if __name__ == "__main__":
     main(sys.argv)

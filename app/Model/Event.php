@@ -1297,30 +1297,50 @@ class Event extends AppModel
     public function filterEventIds($user, &$params = array())
     {
         $conditions = $this->createEventConditions($user);
+		if (isset($params['ignore'])) {
+			$params['to_ids'] = array(0, 1);
+			$params['published'] = array(0, 1);
+		}
+		if (isset($params['searchall'])) {
+			$params['tags'] = $params['searchall'];
+			$params['eventinfo'] = $params['searchall'];
+			$params['value'] = $params['searchall'];
+			$params['comment'] = $params['searchall'];
+		}
+		if (!empty($params['quickfilter']) && !empty($params['value'])) {
+			$params['tags'] = $params['value'];
+			$params['eventinfo'] = $params['value'];
+			$params['comment'] = $params['value'];
+		}
         $simple_params = array(
             'Event' => array(
                 'eventid' => array('function' => 'set_filter_eventid', 'pop' => true),
+				'eventinfo' => array('function' => 'set_filter_eventinfo'),
                 'ignore' => array('function' => 'set_filter_ignore'),
                 'tags' => array('function' => 'set_filter_tags'),
-                'tag' => array('function' => 'set_filter_tags'),
                 'from' => array('function' => 'set_filter_timestamp', 'pop' => true),
                 'to' => array('function' => 'set_filter_timestamp', 'pop' => true),
                 'last' => array('function' => 'set_filter_timestamp', 'pop' => true),
                 'timestamp' => array('function' => 'set_filter_timestamp', 'pop' => true),
+				'event_timestamp' => array('function' => 'set_filter_timestamp', 'pop' => true),
                 'publish_timestamp' => array('function' => 'set_filter_timestamp', 'pop' => true),
                 'org' => array('function' => 'set_filter_org', 'pop' => true),
                 'uuid' => array('function' => 'set_filter_uuid', 'pop' => true),
                 'published' => array('function' => 'set_filter_published', 'pop' => true)
             ),
             'Object' => array(
-                'object_name' => array('function' => 'set_filter_object_name')
+                'object_name' => array('function' => 'set_filter_object_name'),
+				'deleted' => array('function' => 'set_filter_deleted')
             ),
             'Attribute' => array(
                 'value' => array('function' => 'set_filter_value', 'pop' => true),
                 'category' => array('function' => 'set_filter_simple_attribute'),
                 'type' => array('function' => 'set_filter_simple_attribute'),
                 'tags' => array('function' => 'set_filter_tags', 'pop' => true),
-                'uuid' => array('function' => 'set_filter_uuid')
+                'uuid' => array('function' => 'set_filter_uuid'),
+				'deleted' => array('function' => 'set_filter_deleted'),
+				'to_ids' => array('function' => 'set_filter_to_ids'),
+				'comment' => array('function' => 'set_filter_comment')
             )
         );
         foreach ($params as $param => $paramData) {
@@ -1329,7 +1349,8 @@ class Event extends AppModel
                     $options = array(
                         'filter' => $param,
                         'scope' => $scope,
-                        'pop' => !empty($simple_param_scoped[$param]['pop'])
+                        'pop' => !empty($simple_param_scoped[$param]['pop']),
+						'context' => 'Event'
                     );
                     if ($scope === 'Event') {
                         $conditions = $this->{$simple_param_scoped[$param]['function']}($params, $conditions, $options);
@@ -1470,6 +1491,7 @@ class Event extends AppModel
             'last',
             'to_ids',
             'includeAllTags',
+			'withAttachments',
             'includeAttachments',
             'event_uuid',
             'distribution',
@@ -1622,8 +1644,8 @@ class Event extends AppModel
             }
         }
 
-        if ($options['to_ids']) {
-            $conditionsAttributes['AND'][] = array('Attribute.to_ids' => 1);
+        if (!empty($options['to_ids']) || $options['to_ids'] === 0) {
+            $conditionsAttributes['AND'][] = array('Attribute.to_ids' => $options['to_ids']);
         }
 
         // removing this for now, we export the to_ids == 0 attributes too, since there is a to_ids field indicating it in the .xml
@@ -1901,6 +1923,7 @@ class Event extends AppModel
 
     private function __attachSharingGroups($doAttach, $data, $sharingGroupData)
     {
+		if (!$doAttach) return $data;
         foreach ($data as $k => $v) {
             if ($v['distribution'] == 4) {
                 $data[$k]['SharingGroup'] = $sharingGroupData[$v['sharing_group_id']]['SharingGroup'];
@@ -2016,6 +2039,16 @@ class Event extends AppModel
         return $conditions;
     }
 
+	public function set_filter_eventinfo(&$params, $conditions, $options)
+	{
+		if (!empty($params['eventinfo'])) {
+			$params['eventinfo'] = $this->convert_filters($params['eventinfo']);
+			$searchall = empty($params['searchall']) ? false : $params['searchall'];
+			$conditions = $this->generic_add_filter($conditions, $params['eventinfo'], 'Event.info', $searchall);
+		}
+		return $conditions;
+	}
+
     public function set_filter_uuid(&$params, $conditions, $options)
     {
         if (!empty($params['uuid'])) {
@@ -2038,14 +2071,23 @@ class Event extends AppModel
 			} else {
 				$scope = $options['scope'];
 			}
-			if ($params['deleted'])
-			$conditions = $this->
-			$conditions = $this->generic_add_filter($conditions, $params['deleted'], $scope . '.deleted');
+			if ($params['deleted']) {
+				$conditions = $this->generic_add_filter($conditions, $params['deleted'], $scope . '.deleted');
+			}
 		}
 		return $conditions;
 	}
 
-
+	public function set_filter_to_ids(&$params, $conditions, $options)
+	{
+		if (isset($params['to_ids'])) {
+			if ($params['to_ids'] === 'exclude') {
+				$params['to_ids'] = 0;
+			}
+			$conditions['AND']['Attribute.to_ids'] = $params['to_ids'];
+		}
+		return $conditions;
+	}
 
     public function set_filter_ignore(&$params, $conditions, $options)
     {
@@ -2094,10 +2136,21 @@ class Event extends AppModel
     {
         if (!empty($params['value'])) {
             $params[$options['filter']] = $this->convert_filters($params[$options['filter']]);
-            $conditions = $this->generic_add_filter($conditions, $params[$options['filter']], array('Attribute.value1', 'Attribute.value2'));
+			$searchall = empty($params['searchall']) ? false : $params['searchall'];
+            $conditions = $this->generic_add_filter($conditions, $params[$options['filter']], array('Attribute.value1', 'Attribute.value2'), $searchall);
         }
         return $conditions;
     }
+
+	public function set_filter_comment(&$params, $conditions, $options)
+	{
+		if (!empty($params['comment'])) {
+			$params['comment'] = $this->convert_filters($params['comment']);
+			$searchall = empty($params['searchall']) ? false : $params['searchall'];
+			$conditions = $this->generic_add_filter($conditions, $params['comment'], 'Attribute.comment', $searchall);
+		}
+		return $conditions;
+	}
 
     public function set_filter_timestamp(&$params, $conditions, $options)
     {
@@ -2106,16 +2159,24 @@ class Event extends AppModel
         } elseif ($options['filter'] == 'to') {
             $conditions['AND']['Event.date <='] = $params['to'];
         } else {
+			if (empty($options['scope'])) {
+				$scope = 'Attribute';
+			} else {
+				$scope = $options['scope'];
+			}
             $filters = array(
                 'timestamp' => array(
-                    'Event.timestamp'
+                    $scope . '.timestamp'
                 ),
                 'publish_timestamp' => array(
                     'Event.publish_timestamp'
                 ),
                 'last' => array(
                     'Event.publish_timestamp'
-                )
+                ),
+				'event_timestamp' => array(
+					'Event.timestamp'
+				)
             );
             foreach ($filters[$options['filter']] as $f) {
                 $conditions = $this->Attribute->setTimestampConditions($params[$options['filter']], $conditions, $f);
@@ -2976,6 +3037,10 @@ class Event extends AppModel
                     $this->EventTag->save($et);
                 }
             }
+			$parentEvent = $this->find('first', array(
+				'conditions' => array('Event.id' => $this->id),
+				'recursive' => -1
+			));
             if (isset($data['Event']['Attribute']) && !empty($data['Event']['Attribute'])) {
                 foreach ($data['Event']['Attribute'] as $k => $attribute) {
                     $block = false;
@@ -2994,7 +3059,7 @@ class Event extends AppModel
                         }
                     }
                     if (!$block) {
-                        $data['Event']['Attribute'][$k] = $this->Attribute->captureAttribute($attribute, $this->id, $user, 0, $this->Log);
+                        $data['Event']['Attribute'][$k] = $this->Attribute->captureAttribute($attribute, $this->id, $user, 0, $this->Log, $parentEvent);
                     }
                 }
                 $data['Event']['Attribute'] = array_values($data['Event']['Attribute']);
@@ -3009,6 +3074,13 @@ class Event extends AppModel
                             $result = $this->Object->ObjectReference->captureReference($objectRef, $this->id, $user, $this->Log);
                         }
                     }
+                }
+            }
+            // zeroq: check if sightings are attached and add to event
+            if (isset($data['Sighting']) && !empty($data['Sighting'])) {
+                $this->Sighting = ClassRegistry::init('Sighting');
+                foreach ($data['Sighting'] as $s) {
+                    $result = $this->Sighting->saveSightings($s['attribute_uuid'], false, $s['date_sighting'], $user, $s['type'], $s['source'], $s['uuid']);
                 }
             }
             if ($fromXml) {
@@ -3170,6 +3242,13 @@ class Event extends AppModel
                             ));
                         }
                     }
+                }
+            }
+            // zeroq: if sightings then attach to event
+            if (isset($data['Sighting']) && !empty($data['Sighting'])) {
+                $this->Sighting = ClassRegistry::init('Sighting');
+                foreach ($data['Sighting'] as $s) {
+                    $result = $this->Sighting->saveSightings($s['attribute_uuid'], false, $s['date_sighting'], $user, $s['type'], $s['source'], $s['uuid']);
                 }
             }
             // if published -> do the actual publishing
@@ -3710,33 +3789,85 @@ class Event extends AppModel
         }
     }
 
-    public function stix2($id, $user)
+    public function stix2($id, $tags, $attachments, $user, $returnType = 'json', $from = false, $to = false, $last = false, $jobId = false, $returnFile = false)
     {
-        $event = $this->fetchEvent($user, array('eventid' => $id, 'includeAttachments' => 1));
-        App::uses('JSONConverterTool', 'Tools');
-        $converter = new JSONConverterTool();
-        $event = $converter->convert($event[0]);
-        $randomFileName = $this->generateRandomFileName();
-        $tmpDir = APP . "files" . DS . "scripts" . DS . "tmp";
-        $tempFile = new File($tmpDir . DS . $randomFileName, true, 0644);
-        $tempFile->write($event);
-        $scriptFile = APP . "files" . DS . "scripts" . DS . "stix2" . DS . "misp2stix2.py";
-        $result = shell_exec('python3 ' . $scriptFile . ' ' . $tempFile->path . ' json  ' . escapeshellarg(Configure::read('MISP.baseurl')) . ' ' . escapeshellarg(Configure::read('MISP.org')) . ' 2>' . APP . 'tmp/logs/exec-errors.log');
-        $tempFile->delete();
-        $resultFile = new File($tmpDir . DS . $randomFileName . ".stix2");
-        $resultFile->write("{\"type\": \"bundle\", \"spec_version\": \"2.0\", \"id\": \"bundle--" . CakeText::uuid() . "\", \"objects\": [");
-        if (trim($result) == 1) {
-            $file = new File($tmpDir . DS . $randomFileName . '.out', true, 0644);
-            $result = substr($file->read(), 1, -1);
-            $file->delete();
-            $resultFile->append($result);
-        } else {
-            return false;
+        $eventIDs = $this->Attribute->dissectArgs($id);
+        $tagIDs = $this->Attribute->dissectArgs($tags);
+        $idList = $this->getAccessibleEventIds($eventIDs[0], $eventIDs[1], $tagIDs[0], $tagIDs[1]);
+        if (!empty($idList)) {
+            $event_ids = $this->fetchEventIds($user, $from, $to, $last, true);
+            $event_ids = array_intersect($event_ids, $idList);
         }
-        $resultFile->append("]}\n");
-        $data2return = $resultFile->read();
-        $resultFile->delete();
-        return $data2return;
+        $randomFileName = $this->generateRandomFileName();
+        $tmpDir = APP . "files" . DS . "scripts";
+        $stix2_framing_cmd = 'python3 ' . $tmpDir . DS . 'misp_framing.py stix2 ' . escapeshellarg(CakeText::uuid()) . ' 2>' . APP . 'tmp/logs/exec-errors.log';
+        $stix2_framing = json_decode(shell_exec($stix2_framing_cmd), true);
+        if (empty($stix2_framing)) {
+            return array('success' => 0, 'message' => 'There was an issue generating the STIX 2.0 export.');
+        }
+        $separator = $stix2_framing['separator'];
+        $tmpDir = $tmpDir . DS . "tmp";
+        $stixFile = new File($tmpDir . DS . $randomFileName . ".stix");
+        $stixFile->write($stix2_framing['header']);
+        if ($jobId) {
+            $this->Job = ClassRegistry::init('Job');
+            $this->Job->id = $jobId;
+            if (!$this->Job->exists()) {
+                $jobId = false;
+            }
+        }
+        $i = 0;
+        $eventCount = count($event_ids);
+        $ORGs = ' ';
+        if ($event_ids) {
+            foreach ($event_ids as $event_id) {
+                $tempFile = new File($tmpDir . DS . $randomFileName, true, 0644);
+                $event = $this->fetchEvent($user, array('eventid' => $event_id, 'includeAttachments' => 1));
+                if (empty($event)) {
+                    continue;
+                }
+                $event[0]['Tag'] = array();
+                foreach ($event[0]['EventTag'] as $tag) {
+                    $event[0]['Tag'][] = $tag['Tag'];
+                }
+                App::uses('JSONConverterTool', 'Tools');
+                $converter = new JSONConverterTool();
+                $event = $converter->convert($event[0]);
+                $tempFile->write($event);
+                unset($event);
+                $scriptFile = APP . "files" . DS . "scripts" . DS . "stix2" . DS . "misp2stix2.py";
+                $result = shell_exec('python3 ' . $scriptFile . ' ' . $tempFile->path . $ORGs . '2>' . APP . 'tmp/logs/exec-errors.log');
+                $decoded = json_decode($result, true);
+                if (isset($decoded['success']) && $decoded['success'] == 1) {
+                    if (isset($decoded['org'])) {
+                        $ORGs = $ORGs . $decoded['org'] . ' ';
+                    }
+                    $file = new File($tmpDir . DS . $randomFileName . '.out', true, 0644);
+                    $result = substr($file->read(), 1, -1);
+                    $file->delete();
+                    $stixFile->append($result . (($i + 1) != $eventCount ? $separator : ''));
+                } else {
+                    return false;
+                }
+                $i++;
+                if ($jobId) {
+                    $this->Job->saveField('message', 'Event ' . $i . '/' . $eventCount);
+                    if ($i % 10 == 0) {
+                        $this->Job->saveField('progress', $i * 80 / $eventCount);
+                    }
+                }
+                $tempFile->close();
+            }
+        }
+        $stixFile->append($stix2_framing['footer']);
+        if ($tempFile) {
+            $tempFile->delete();
+        }
+        if (!$returnFile) {
+            $data2return = $stixFile->read();
+            $stixFile->delete();
+        }
+        return array('success' => 1, 'data' => $returnFile ? $stixFile->path : $data2return);
     }
 
     public function stix($id, $tags, $attachments, $user, $returnType = 'xml', $from = false, $to = false, $last = false, $jobId = false, $returnFile = false)
@@ -3749,17 +3880,16 @@ class Event extends AppModel
             $event_ids = array_intersect($event_ids, $idList);
         }
         $randomFileName = $this->generateRandomFileName();
-        $tmpDir = APP . "files" . DS . "scripts" . DS . "tmp";
-        $stixFile = new File($tmpDir . DS . $randomFileName . ".stix");
-        $stix_framing = shell_exec('python3 ' . APP . "files" . DS . "scripts" . DS . 'misp2stix_framing.py ' . escapeshellarg(Configure::read('MISP.baseurl')) . ' ' . escapeshellarg(Configure::read('MISP.org')) . ' ' . escapeshellarg($returnType) . ' 2>' . APP . 'tmp/logs/exec-errors.log');
+        $tmpDir = APP . "files" . DS . "scripts";
+        $stix_framing_cmd = 'python3 ' . $tmpDir . DS . 'misp_framing.py stix ' . escapeshellarg(Configure::read('MISP.baseurl')) . ' ' . escapeshellarg(Configure::read('MISP.org')) . ' ' . escapeshellarg($returnType) . ' 2>' . APP . 'tmp/logs/exec-errors.log';
+        $stix_framing = json_decode(shell_exec($stix_framing_cmd), true);
         if (empty($stix_framing)) {
-            $stixFile->delete();
             return array('success' => 0, 'message' => 'There was an issue generating the STIX export.');
         }
-        $stixFile->write(substr($stix_framing, 0, -1));
-        if ($returnType === 'xml') {
-            $stixFile->append("    <stix:Related_Packages>\n");
-        }
+        $separator = $stix_framing['separator'];
+        $tmpDir = $tmpDir . DS . "tmp";
+        $stixFile = new File($tmpDir . DS . $randomFileName . ".stix");
+        $stixFile->write($stix_framing['header']);
         $result = array();
         if ($jobId) {
             $this->Job = ClassRegistry::init('Job');
@@ -3812,9 +3942,11 @@ class Event extends AppModel
                     $stix_event[count($stix_event)-1] = str_replace("STIX_Package", "Package", $stix_event[count($stix_event)-1]);
                     $stix_event = implode("\n", $stix_event);
                     $stix_event = str_replace("\n", "\n            ", $stix_event) . "\n";
-                    $stix_event = "        <stix:Related_Package>\n" . $stix_event . "        </stix:Related_Package>\n";
                 } else {
-                    $stix_event = $file->read() . (($i + 1) != $eventCount ? ',' : '');
+                    $stix_event = $file->read();
+                }
+                if (($i + 1) != $eventCount) {
+                    $stix_event .= $separator;
                 }
                 $stixFile->append($stix_event);
                 $file->close();
@@ -3829,11 +3961,7 @@ class Event extends AppModel
                 $tempFile->close();
             }
         }
-        if ($returnType == 'xml') {
-            $stixFile->append("    </stix:Related_Packages>\n</stix:STIX_Package>\n\n");
-        } else {
-            $stixFile->append("]}\n");
-        }
+        $stixFile->append($stix_framing['footer']);
         if ($tempFile) {
             $tempFile->delete();
         }
@@ -4207,35 +4335,39 @@ class Event extends AppModel
         unset($event['Object']);
         unset($event['ShadowAttribute']);
         $referencedObjectFields = array('meta-category', 'name', 'uuid', 'id');
+		$objectReferenceCount = 0;
+		$referencedByArray = array();
         foreach ($event['objects'] as $object) {
             if (!in_array($object['objectType'], array('attribute', 'object'))) {
                 continue;
             }
-            if (!empty($object['ObjectReference'])) {
+			if (!empty($object['ObjectReference'])) {
                 foreach ($object['ObjectReference'] as $reference) {
-                    if (isset($reference['referenced_uuid'])) {
-                        foreach ($event['objects'] as $k => $v) {
-                            if ($v['uuid'] == $reference['referenced_uuid']) {
-                                $temp = array();
-                                foreach ($referencedObjectFields as $field) {
-                                    if (isset($object[$field])) {
-                                        $temp[$field] = $object[$field];
-                                    }
-                                }
-                                $temp['relationship_type'] = $reference['relationship_type'];
-                                $event['objects'][$k]['referenced_by'][$object['objectType']][] = $temp;
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        App::uses('CustomPaginationTool', 'Tools');
+					if (isset($reference['referenced_uuid'])) {
+						$referencedByArray[$reference['referenced_uuid']][$object['objectType']][] = array(
+							'meta-category' => $object['meta-category'],
+							'name' => $object['name'],
+							'uuid' => $object['uuid'],
+							'id' => $object['id'],
+							'object_type' => $object['objectType']
+						);
+					}
+				}
+			}
+		}
+		App::uses('CustomPaginationTool', 'Tools');
         $customPagination = new CustomPaginationTool();
         if ($all) {
             $passedArgs['page'] = 0;
         }
         $params = $customPagination->applyRulesOnArray($event['objects'], $passedArgs, 'events', 'category');
+		foreach ($event['objects'] as $k => $object) {
+			if (isset($referencedByArray[$object['uuid']])) {
+				foreach ($referencedByArray[$object['uuid']] as $objectType => $references) {
+					$event['objects'][$k]['referenced_by'][$objectType] = $references;
+				}
+			}
+		}
         $params['total_elements'] = count($event['objects']);
         $event['Event']['warnings'] = $eventWarnings;
         return $params;
@@ -4729,7 +4861,7 @@ class Event extends AppModel
         return $this->save($event);
     }
 
-    public function upload_stix($user, $filename, $stix_version)
+    public function upload_stix($user, $filename, $stix_version, $original_file)
     {
         App::uses('Folder', 'Utility');
         App::uses('File', 'Utility');
@@ -4746,7 +4878,7 @@ class Event extends AppModel
         } else {
             throw new MethodNotAllowedException('Invalid STIX version');
         }
-        $shell_command .=  ' ' . escapeshellarg(Configure::read('MISP.default_event_distribution')) . ' ' . escapeshellarg(Configure::read('MISP.default_attribute_distribution')) . ' 2>' . APP . 'tmp/logs/exec-errors.log';
+        $shell_command .=  ' ' . $original_file . ' ' . escapeshellarg(Configure::read('MISP.default_event_distribution')) . ' ' . escapeshellarg(Configure::read('MISP.default_attribute_distribution')) . ' 2>' . APP . 'tmp/logs/exec-errors.log';
         $result = shell_exec($shell_command);
         unlink($tempFilePath);
         if (trim($result) == '1') {
@@ -4939,4 +5071,201 @@ class Event extends AppModel
         ));
         return false;
     }
+
+	public function processFreeTextData($user, $attributes, $id, $default_comment = '', $force = false, $adhereToWarninglists = false, $jobId = false)
+	{
+		$event = $this->find('first', array(
+			'conditions' => array('id' => $id),
+			'recursive' => -1,
+			'fields' => array('orgc_id', 'id', 'distribution', 'published', 'uuid'),
+		));
+		if (!$user['Role']['perm_site_admin'] && !empty($event) && $event['Event']['orgc_id'] != $user['org_id']) {
+			$objectType = 'ShadowAttribute';
+		} elseif ($user['Role']['perm_site_admin'] && isset($force) && $force) {
+			$objectType = 'ShadowAttribute';
+		} else {
+			$objectType = 'Attribute';
+		}
+
+		if ($adhereToWarninglists) {
+			$this->Warninglist = ClassRegistry::init('Warninglist');
+			$warninglists = $this->Warninglist->fetchForEventView();
+		}
+		$saved = 0;
+		$failed = 0;
+		$attributeSources = array('attributes', 'ontheflyattributes');
+		$ontheflyattributes = array();
+		$i = 0;
+		$total = count($attributeSources);
+		if ($jobId) {
+			$this->Job = ClassRegistry::init('Job');
+			$this->Job->id = $jobId;
+		}
+		foreach ($attributeSources as $sourceKey => $source) {
+			foreach (${$source} as $k => $attribute) {
+				if ($attribute['type'] == 'ip-src/ip-dst') {
+					$types = array('ip-src', 'ip-dst');
+				} elseif ($attribute['type'] == 'ip-src|port/ip-dst|port') {
+					$types = array('ip-src|port', 'ip-dst|port');
+				} elseif ($attribute['type'] == 'malware-sample') {
+					if (!isset($attribute['data_is_handled']) || !$attribute['data_is_handled']) {
+						$result = $this->Attribute->handleMaliciousBase64($id, $attribute['value'], $attribute['data'], array('md5', 'sha1', 'sha256'), $objectType == 'ShadowAttribute' ? true : false);
+						if (!$result['success']) {
+							$failed++;
+							continue;
+						}
+						$attribute['data'] = $result['data'];
+						$shortValue = $attribute['value'];
+						$attribute['value'] = $shortValue . '|' . $result['md5'];
+						$additionalHashes = array('sha1', 'sha256');
+						foreach ($additionalHashes as $hash) {
+							$temp = $attribute;
+							$temp['type'] = 'filename|' . $hash;
+							$temp['value'] = $shortValue . '|' . $result[$hash];
+							unset($temp['data']);
+							$ontheflyattributes[] = $temp;
+						}
+					}
+					$types = array($attribute['type']);
+				} else {
+					$types = array($attribute['type']);
+				}
+				foreach ($types as $type) {
+					$this->$objectType->create();
+					$attribute['type'] = $type;
+					if (empty($attribute['comment'])) {
+						$attribute['comment'] = $default_comment;
+					}
+					$attribute['event_id'] = $id;
+					if ($objectType == 'ShadowAttribute') {
+						$attribute['org_id'] = $user['Role']['org_id'];
+						$attribute['event_org_id'] = $event['Event']['orgc_id'];
+						$attribute['email'] = $user['Role']['email'];
+						$attribute['event_uuid'] = $event['Event']['uuid'];
+					}
+					// adhere to the warninglist
+					if ($adhereToWarninglists) {
+						if (!$this->Warninglist->filterWarninglistAttributes($warninglists, $attribute)) {
+							if ($adhereToWarninglists == 'soft') {
+								$attribute['to_ids'] = 0;
+							} else {
+								// just ignore the attribute
+								continue;
+							}
+						}
+					}
+					$AttributSave = $this->$objectType->save($attribute);
+					if ($AttributSave) {
+						// If Tags, attache each tags to attribut
+						if (!empty($attribute['tags'])) {
+							foreach (explode(",", $attribute['tags']) as $tagName) {
+								$this->loadModel('Tag');
+								$TagId = $this->Tag->captureTag(array('name' => $tagName), array('Role' => $user['Role']));
+								$this->loadModel('AttributeTag');
+								if (!$this->AttributeTag->attachTagToAttribute($AttributSave['Attribute']['id'], $id, $TagId)) {
+									throw new MethodNotAllowedException(__('Could not add tags.'));
+								}
+							}
+						}
+						$saved++;
+					} else {
+						$lastError = $this->$objectType->validationErrors;
+						$failed++;
+					}
+				}
+				if ($jobId) {
+                    if ($i % 20 == 0) {
+						$this->Job->saveField('message', 'Attribute ' . $i . '/' . $total);
+                        $this->Job->saveField('progress', $i * 80 / $total);
+                    }
+                }
+			}
+		}
+		$emailResult = '';
+		$messageScope = $objectType == 'ShadowAttribute' ? 'proposals' : 'attributes';
+		if ($saved > 0) {
+			if ($objectType != 'ShadowAttribute') {
+				$event = $this->find('first', array(
+						'conditions' => array('Event.id' => $id),
+						'recursive' => -1
+				));
+				if ($event['Event']['published'] == 1) {
+					$event['Event']['published'] = 0;
+				}
+				$date = new DateTime();
+				$event['Event']['timestamp'] = $date->getTimestamp();
+				$this->save($event);
+			} else {
+				if (!$this->ShadowAttribute->sendProposalAlertEmail($id)) {
+					$emailResult = " but sending out the alert e-mails has failed for at least one recipient";
+				}
+			}
+		}
+		if ($failed > 0) {
+			if ($failed == 1) {
+				$message = $saved . ' ' . $messageScope . ' created' . $emailResult . '. ' . $failed . ' ' . $messageScope . ' could not be saved. Reason for the failure: ' . json_encode($lastError);
+			} else {
+				$message = $saved . ' ' . $messageScope . ' created' . $emailResult . '. ' . $failed . ' ' . $messageScope . ' could not be saved. This may be due to attributes with similar values already existing.';
+			}
+		} else {
+			$message = $saved . ' ' . $messageScope . ' created' . $emailResult . '.';
+		}
+		if ($jobId) {
+			if ($i % 20 == 0) {
+				$this->Job->saveField('message', 'Processing complete. ' . $message);
+				$this->Job->saveField('progress', 100);
+			}
+		}
+		return $message;
+	}
+
+	public function processFreeTextDataRouter($user, $attributes, $id, $default_comment = '', $force = false, $adhereToWarninglists = false)
+	{
+		if (Configure::read('MISP.background_jobs')) {
+			$job = ClassRegistry::init('Job');
+			$job->create();
+			$data = array(
+					'worker' => 'default',
+					'job_type' => 'process_freetext_data',
+					'job_input' => 'Event: ' . $id,
+					'status' => 0,
+					'retries' => 0,
+					'org_id' => $user['org_id'],
+					'org' => $user['Organisation']['name'],
+					'message' => 'Processing...',
+			);
+			$job->save($data);
+			$randomFileName = $this->generateRandomFileName() . '.json';
+			App::uses('Folder', 'Utility');
+			App::uses('File', 'Utility');
+			$tempdir = new Folder(APP . 'tmp/cache/ingest', true, 0755);
+			$tempFile = new File(APP . 'tmp/cache/ingest' . DS . $randomFileName, true, 0644);
+			$tempData = array(
+					'user' => $user,
+					'attributes' => $attributes,
+					'id' => $id,
+					'default_comment' => $default_comment,
+					'force' => $force,
+					'adhereToWarninglists' => $adhereToWarninglists,
+					'jobId' => $job->id
+			);
+
+			$writeResult = $tempFile->write(json_encode($tempData));
+			if (!$writeResult) {
+				return ($this->processFreeTextData($user, $attributes, $id, $default_comment = '', $force = false, $adhereToWarninglists = false));
+			}
+			$tempFile->close();
+			$jobId = $job->id;
+			$process_id = CakeResque::enqueue(
+					'prio',
+					'EventShell',
+					array('processfreetext', $randomFileName),
+					true
+			);
+			$job->saveField('process_id', $process_id);
+			return 'Freetext ingestion queued for background processing. Attributes will be added to the event as they are being processed.';
+		} else {
+			return ($this->processFreeTextData($user, $attributes, $id, $default_comment = '', $force = false, $adhereToWarninglists = false));
+		}
+	}
 }

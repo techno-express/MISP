@@ -2083,7 +2083,7 @@ class AttributesController extends AppController
     }
 
     public function restSearch($returnFormat = 'json', $value = false, $type = false, $category = false, $org = false, $tags = false, $from = false, $to = false, $last = false, $eventid = false, $withAttachments = false, $uuid = false, $publish_timestamp = false, $published = false, $timestamp = false, $enforceWarninglist = false, $to_ids = false, $deleted = false, $includeEventUuid = false, $event_timestamp = false, $threat_level_id = false) {
-        $paramArray = array('value' , 'type', 'category', 'org', 'tags', 'from', 'to', 'last', 'eventid', 'withAttachments', 'uuid', 'publish_timestamp', 'timestamp', 'enforceWarninglist', 'to_ids', 'deleted', 'includeEventUuid', 'event_timestamp', 'threat_level_id');
+        $paramArray = array('value' , 'type', 'category', 'org', 'tags', 'from', 'to', 'last', 'eventid', 'withAttachments', 'uuid', 'publish_timestamp', 'timestamp', 'enforceWarninglist', 'to_ids', 'deleted', 'includeEventUuid', 'event_timestamp', 'threat_level_id', 'includeEventTags');
         $filterData = array(
             'request' => $this->request,
             'named_params' => $this->params['named'],
@@ -2096,7 +2096,8 @@ class AttributesController extends AppController
             'xml' => array('xml', 'XmlExport'),
             'suricata' => array('txt', 'NidsSuricataExport'),
             'snort' => array('txt', 'NidsSnortExport'),
-			'text' => array('txt', 'TextExport')
+			'text' => array('txt', 'TextExport'),
+			'rpz' => array('rpz', 'RPZExport')
         );
         $exception = false;
         $filters = $this->_harvestParameters($filterData, $exception);
@@ -2112,6 +2113,22 @@ class AttributesController extends AppController
         if (isset($filters['returnFormat'])) {
           $returnFormat = $filters['returnFormat'];
         }
+		if ($returnFormat === 'download') {
+			$returnFormat = 'json';
+		}
+		if (!isset($validFormats[$returnFormat][1])) {
+			throw new NotFoundException('Invalid output format.');
+		}
+		App::uses($validFormats[$returnFormat][1], 'Export');
+		$exportTool = new $validFormats[$returnFormat][1]();
+		if (empty($exportTool->non_restrictive_export)) {
+			if (!isset($filters['to_ids'])) {
+				$filters['to_ids'] = 1;
+			}
+			if (!isset($filters['published'])) {
+				$filters['published'] = 1;
+			}
+		}
         $conditions = $this->Attribute->buildFilterConditions($this->Auth->user(), $filters);
         $params = array(
                 'conditions' => $conditions,
@@ -2121,7 +2138,17 @@ class AttributesController extends AppController
                 'includeAllTags' => true,
                 'flatten' => 1,
                 'includeEventUuid' => !empty($filters['includeEventUuid']) ? $filters['includeEventUuid'] : 0,
+				'includeEventTags' => !empty($filters['includeEventTags']) ? $filters['includeEventTags'] : 0
         );
+		if (isset($filters['include_event_uuid'])) {
+			$params['includeEventUuid'] = $filters['include_event_uuid'];
+		}
+		if (isset($filters['limit'])) {
+			$params['limit'] = $filters['limit'];
+		}
+		if (isset($filters['page'])) {
+			$params['page'] = $filters['page'];
+		}
         if (!empty($filtes['deleted'])) {
             $params['deleted'] = 1;
             if ($params['deleted'] === 'only') {
@@ -2129,47 +2156,67 @@ class AttributesController extends AppController
                 $params['conditions']['AND'][] = array('Object.deleted' => 1);
             }
         }
-		App::uses($validFormats[$returnFormat][1], 'Export');
-		$exportTool = new $validFormats[$returnFormat][1]();
+		if (!isset($validFormats[$returnFormat])) {
+			// this is where the new code path for the export modules will go
+			throw new MethodNotFoundException('Invalid export format.');
+		}
 		$exportToolParams = array(
 			'user' => $this->Auth->user(),
 			'params' => $params,
 			'returnFormat' => $returnFormat,
-			'scope' => 'Attribute'
+			'scope' => 'Attribute',
+			'filters' => $filters
 		);
 		if (!empty($exportTool->additional_params)) {
 			$params = array_merge($params, $exportTool->additional_params);
 		}
-        $final = '';
-        $final .= $exportTool->header($exportToolParams);
-		$continue = false;
+		$tmpfile = tmpfile();
+		fwrite($tmpfile, $exportTool->header($exportToolParams));
+		$loop = false;
 		if (empty($params['limit'])) {
-			$params['limit'] = 10000;
-			$continue = true;
+			$memory_in_mb = $this->Attribute->convert_to_memory_limit_to_mb(ini_get('memory_limit'));
+			$memory_scaling_factor = isset($exportTool->memory_scaling_factor) ? $exportTool->memory_scaling_factor : 100;
+			$params['limit'] = $memory_in_mb * $memory_scaling_factor;
+			$loop = true;
 			$params['page'] = 1;
 		}
-		$this->loadModel('Whitelist');
+		$this->__iteratedFetch($params, $loop, $tmpfile, $exportTool, $exportToolParams);
+		fwrite($tmpfile, $exportTool->footer($exportToolParams));
+		fseek($tmpfile, 0);
+		$final = fread($tmpfile, fstat($tmpfile)['size']);
+        $responseType = $validFormats[$returnFormat][0];
+        return $this->RestResponse->viewData($final, $responseType, false, true);
+    }
+
+	private function __iteratedFetch(&$params, &$loop, &$tmpfile, $exportTool, $exportToolParams) {
+		$continue = true;
 		while ($continue) {
+			$this->loadModel('Whitelist');
 			$results = $this->Attribute->fetchAttributes($this->Auth->user(), $params, $continue);
 			$params['page'] += 1;
 			$results = $this->Whitelist->removeWhitelistedFromArray($results, true);
 			$results = array_values($results);
 	        $i = 0;
+			$temp = '';
 	        foreach ($results as $attribute) {
-				$temp = $exportTool->handler($attribute, $exportToolParams);
+				$temp .= $exportTool->handler($attribute, $exportToolParams);
 				if ($temp !== '') {
-	            	$final .= $temp;
 	            	if ($i != count($results) -1) {
-	                	$final .= $exportTool->separator($exportToolParams);
+	                	$temp .= $exportTool->separator($exportToolParams);
 	            	}
 				}
 	            $i++;
 	        }
+			if (!$loop) {
+				$continue = false;
+			}
+			if ($continue) {
+				$temp .= $exportTool->separator($exportToolParams);
+			}
+			fwrite($tmpfile, $temp);
 		}
-        $final .= $exportTool->footer($exportToolParams);
-        $responseType = $validFormats[$returnFormat][0];
-        return $this->RestResponse->viewData($final, $responseType, false, true);
-    }
+		return true;
+	}
 
     // returns an XML with attributes that belong to an event. The type of attributes to be returned can be restricted by type using the 3rd parameter.
     // Similar to the restSearch, this parameter can be chained with '&&' and negations are accepted too. For example filename&&!filename|md5 would return all filenames that don't have an md5
@@ -2386,7 +2433,7 @@ class AttributesController extends AppController
                 if (isset($data['request'][$p])) {
                     ${$p} = $data['request'][$p];
                 } else {
-                    ${$p} = null;
+                    ${$p} = false;
                 }
             }
         }
@@ -2438,7 +2485,7 @@ class AttributesController extends AppController
                 throw new UnauthorizedException(__('You have to be logged in to do that.'));
             }
         }
-        if (false === $eventId) {
+        if (false === $eventId || $eventId === null) {
             $eventIds = $this->Attribute->Event->fetchEventIds($this->Auth->user(), false, false, false, true);
         } elseif (is_numeric($eventId)) {
             $eventIds = array($eventId);
@@ -3105,10 +3152,6 @@ class AttributesController extends AppController
                 $resultArray[] = array($type => 'Enrichment service not reachable.');
                 continue;
             }
-            if (!is_array($result)) {
-                $resultArray[] =  array($type => $result);
-                continue;
-            }
             if (!empty($result['results'])) {
                 foreach ($result['results'] as $r) {
                     if (is_array($r['values']) && !empty($r['values'])) {
@@ -3117,7 +3160,7 @@ class AttributesController extends AppController
                             if (is_array($v)) {
                                 $v = 'Array returned';
                             }
-                            $tempArray[] = $k . ': ' . $v;
+                            $tempArray[$k] = $v;
                         }
                         $resultArray[] = array($type => $tempArray);
                     } elseif ($r['values'] == null) {
